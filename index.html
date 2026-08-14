@@ -3,8 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow, noarchive">
     <title>Agenda Digital MAN Balikpapan</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore-compat.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap');
 
@@ -415,17 +418,26 @@
 
     <script>
         /* =========================================================
-           BACKEND: window.storage (shared = true)
-           Semua pengaturan disimpan di 1 key "config" agar 1 kali
-           panggilan saja tiap kali simpan/muat (hemat kuota & cepat).
-           Karena shared:true, data ini bisa diakses dari perangkat
-           mana pun yang membuka artifact/tautan yang sama - jadi
-           Panel Admin (HP/laptop staf TU) dan Tampilan TV (layar TV)
-           bisa berbeda perangkat tapi tetap sinkron.
+           BACKEND: Firebase Firestore (real-time)
+           Panel Admin menulis ke dokumen 'signage/config'.
+           Tampilan TV MENDENGARKAN dokumen itu dengan onSnapshot,
+           jadi begitu Admin menyimpan, TV langsung berubah tanpa
+           perlu menunggu polling atau refresh manual.
         ========================================================= */
 
-        const CONFIG_KEY = 'config';
-        const PIN_KEY = 'admin-pin';
+        const firebaseConfig = {
+            apiKey: "AIzaSyCVGqPD4x2BvYHGWufI5UTodQsD9Z0ms-c",
+            authDomain: "agenda-manbpn.firebaseapp.com",
+            projectId: "agenda-manbpn",
+            storageBucket: "agenda-manbpn.firebasestorage.app",
+            messagingSenderId: "434686141945",
+            appId: "1:434686141945:web:097e0c228832e18a58c928"
+        };
+
+        firebase.initializeApp(firebaseConfig);
+        const db = firebase.firestore();
+        const configDocRef = db.collection('signage').doc('config');
+        const securityDocRef = db.collection('signage').doc('security');
 
         const defaultData = {
             theme: 'hijau',
@@ -462,24 +474,25 @@
             if (b) b.style.display = show ? 'block' : 'none';
         }
 
+        // Dipakai Panel Admin untuk mengambil data satu kali saat form dibuka.
         async function loadConfig() {
             try {
-                const result = await window.storage.get(CONFIG_KEY, true);
+                const snap = await configDocRef.get();
                 setSyncDot(true);
-                if (result && result.value) return JSON.parse(result.value);
+                if (snap.exists) return snap.data();
                 return defaultData;
             } catch (e) {
-                // Key belum pernah dibuat, atau gagal mengambil -> pakai default
                 setSyncDot(false);
+                console.error('Gagal memuat konfigurasi:', e);
                 return defaultData;
             }
         }
 
         async function saveConfig(data) {
             try {
-                const res = await window.storage.set(CONFIG_KEY, JSON.stringify(data), true);
-                setSyncDot(!!res);
-                return !!res;
+                await configDocRef.set(data);
+                setSyncDot(true);
+                return true;
             } catch (e) {
                 setSyncDot(false);
                 console.error('Gagal menyimpan konfigurasi:', e);
@@ -489,8 +502,8 @@
 
         async function getPin() {
             try {
-                const result = await window.storage.get(PIN_KEY, true);
-                if (result && result.value) return result.value;
+                const snap = await securityDocRef.get();
+                if (snap.exists && snap.data().pin) return snap.data().pin;
                 return '1234';
             } catch (e) {
                 return '1234';
@@ -499,7 +512,7 @@
 
         async function setPin(newPin) {
             try {
-                await window.storage.set(PIN_KEY, newPin, true);
+                await securityDocRef.set({ pin: newPin }, { merge: true });
                 return true;
             } catch (e) {
                 console.error('Gagal menyimpan PIN:', e);
@@ -511,8 +524,7 @@
            TAMPILAN TV
         ========================================================= */
 
-        async function renderTV(forceSlider) {
-            const data = await loadConfig();
+        function applyConfigToTV(data) {
             const dataString = JSON.stringify(data);
             const playlistChanged = dataString !== lastConfigString;
             lastConfigString = dataString;
@@ -562,10 +574,26 @@
 
             window.__signageData = data;
 
-            if (forceSlider || playlistChanged) {
+            if (playlistChanged) {
                 currentSlide = 0;
                 playSlider();
             }
+        }
+
+        let unsubscribeConfigListener = null;
+        function startRealtimeListener() {
+            if (unsubscribeConfigListener) unsubscribeConfigListener();
+            unsubscribeConfigListener = configDocRef.onSnapshot(
+                (snap) => {
+                    setSyncDot(true);
+                    applyConfigToTV(snap.exists ? snap.data() : defaultData);
+                },
+                (err) => {
+                    console.error('Listener Firestore gagal:', err);
+                    setSyncDot(false);
+                    if (!window.__signageData) applyConfigToTV(defaultData);
+                }
+            );
         }
 
         let currentSlide = 0;
@@ -648,7 +676,8 @@
 
         // Polling: TV memuat ulang data setiap 20 detik supaya perubahan dari
         // Panel Admin (di perangkat lain) otomatis muncul tanpa refresh manual.
-        setInterval(() => { if (!isAdmin) renderTV(false); }, 20000);
+        // Tidak perlu polling lagi \u2014 onSnapshot() akan otomatis memberi
+        // data terbaru begitu ada perubahan di Firestore (lihat startRealtimeListener).
 
         /* =========================================================
            MODE ADMIN / TV
@@ -667,8 +696,6 @@
                 document.getElementById('login-gate').style.display = unlocked ? 'none' : 'flex';
                 document.getElementById('admin-content').style.display = unlocked ? 'block' : 'none';
                 if (unlocked) loadAdminForm();
-            } else {
-                renderTV(false);
             }
         }
 
@@ -819,17 +846,18 @@
             if (ok) {
                 statusEl.classList.add('ok');
                 statusEl.innerText = 'Perubahan berhasil disimpan. Tampilan TV akan otomatis diperbarui.';
-                renderTV(true);
             } else {
                 statusEl.classList.add('err');
                 statusEl.innerText = 'Gagal menyimpan. Periksa koneksi lalu coba lagi.';
             }
         }
 
-        // Inisialisasi awal
-        (async function init() {
+        // Inisialisasi awal: pasang listener real-time Firestore.
+        // Sejak saat ini, setiap perubahan di Firestore (dari Admin
+        // manapun) akan langsung tercermin di Tampilan TV.
+        (function init() {
             showLoading(true);
-            await renderTV(true);
+            startRealtimeListener();
             showLoading(false);
         })();
     </script>
